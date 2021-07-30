@@ -14,18 +14,17 @@ glob or regular expressions.
 
 
 import collections
-import fnmatch
 import json
 import os
 import os.path
 import re
 import shutil
-import sys
 import asyncio
 import shlex
 import multiprocessing
-
 from typing import Any, Dict, Iterable, List, Set, Tuple
+
+from tools.linter.utils import CommandResult, ProgressMeter, run_cmd
 
 Patterns = collections.namedtuple("Patterns", "positive, negative")
 
@@ -45,117 +44,6 @@ QUIET = False
 def log(*args: Any, **kwargs: Any) -> None:
     if not QUIET:
         print(*args, **kwargs)
-
-
-class CommandResult:
-    def __init__(self, returncode: int, stdout: str, stderr: str):
-        self.returncode = returncode
-        self.stdout = stdout.strip()
-        self.stderr = stderr.strip()
-
-    def failed(self) -> bool:
-        return self.returncode != 0
-
-    def __add__(self, other: "CommandResult") -> "CommandResult":
-        return CommandResult(
-            self.returncode + other.returncode,
-            f"{self.stdout}\n{other.stdout}",
-            f"{self.stderr}\n{other.stderr}",
-        )
-
-    def __str__(self) -> str:
-        return f"{self.stdout}"
-
-    def __repr__(self) -> str:
-        return (
-            f"returncode: {self.returncode}\n"
-            + f"stdout: {self.stdout}\n"
-            + f"stderr: {self.stderr}"
-        )
-
-
-class ProgressMeter:
-    def __init__(
-        self, num_items: int, start_msg: str = "", disable_progress_bar: bool = False
-    ) -> None:
-        self.num_items = num_items
-        self.num_processed = 0
-        self.width = 80
-        self.disable_progress_bar = disable_progress_bar
-
-        # helper escape sequences
-        self._clear_to_end = "\x1b[2K"
-        self._move_to_previous_line = "\x1b[F"
-        self._move_to_start_of_line = "\r"
-        self._move_to_next_line = "\n"
-
-        if self.disable_progress_bar:
-            log(start_msg)
-        else:
-            self._write(
-                start_msg
-                + self._move_to_next_line
-                + "[>"
-                + (self.width * " ")
-                + "]"
-                + self._move_to_start_of_line
-            )
-            self._flush()
-
-    def _write(self, s: str) -> None:
-        sys.stderr.write(s)
-
-    def _flush(self) -> None:
-        sys.stderr.flush()
-
-    def update(self, msg: str) -> None:
-        if self.disable_progress_bar:
-            return
-
-        # Once we've processed all items, clear the progress bar
-        if self.num_processed == self.num_items - 1:
-            self._write(self._clear_to_end)
-            return
-
-        # NOP if we've already processed all items
-        if self.num_processed > self.num_items:
-            return
-
-        self.num_processed += 1
-
-        self._write(
-            self._move_to_previous_line
-            + self._clear_to_end
-            + msg
-            + self._move_to_next_line
-        )
-
-        progress = int((self.num_processed / self.num_items) * self.width)
-        padding = self.width - progress
-        self._write(
-            self._move_to_start_of_line
-            + self._clear_to_end
-            + f"({self.num_processed} of {self.num_items}) "
-            + f"[{progress*'='}>{padding*' '}]"
-            + self._move_to_start_of_line
-        )
-        self._flush()
-
-    def print(self, msg: str) -> None:
-        if QUIET:
-            return
-        elif self.disable_progress_bar:
-            print(msg)
-        else:
-            self._write(
-                self._clear_to_end
-                + self._move_to_previous_line
-                + self._clear_to_end
-                + msg
-                + self._move_to_next_line
-                + self._move_to_next_line
-            )
-            self._flush()
 
 
 class ClangTidyWarning:
@@ -217,13 +105,13 @@ async def _run_clang_tidy_in_parallel(
 
     async def helper() -> Any:
         def on_completed(result: CommandResult, filename: str) -> None:
-            if result.failed():
+            if result.failed() and not QUIET:
                 msg = str(result) if not VERBOSE else repr(result)
                 progress_meter.print(msg)
             progress_meter.update(f"Processed {filename}")
 
         coros = [
-            run_shell_command(cmd, on_completed, filename)
+            run_cmd(cmd, on_completed, on_completed_args=[filename])
             for (cmd, filename) in commands
         ]
         return await gather_with_concurrency(multiprocessing.cpu_count(), coros)
@@ -343,55 +231,6 @@ def map_filenames(build_folder: str, fnames: Iterable[str]) -> List[str]:
     return [map_filename(build_folder, fname) for fname in fnames]
 
 
-def split_negative_from_positive_patterns(patterns: Iterable[str]) -> Patterns:
-    """Separates negative patterns (that start with a dash) from positive patterns"""
-    positive, negative = [], []
-    for pattern in patterns:
-        if pattern.startswith("-"):
-            negative.append(pattern[1:])
-        else:
-            positive.append(pattern)
-
-    return Patterns(positive, negative)
-
-
-def get_file_patterns(globs: Iterable[str], regexes: Iterable[str]) -> Patterns:
-    """Returns a list of compiled regex objects from globs and regex pattern strings."""
-    # fnmatch.translate converts a glob into a regular expression.
-    # https://docs.python.org/2/library/fnmatch.html#fnmatch.translate
-    glob = split_negative_from_positive_patterns(globs)
-    regexes_ = split_negative_from_positive_patterns(regexes)
-
-    positive_regexes = regexes_.positive + [fnmatch.translate(g) for g in glob.positive]
-    negative_regexes = regexes_.negative + [fnmatch.translate(g) for g in glob.negative]
-
-    positive_patterns = [re.compile(regex) for regex in positive_regexes] or [
-        DEFAULT_FILE_PATTERN
-    ]
-    negative_patterns = [re.compile(regex) for regex in negative_regexes]
-
-    return Patterns(positive_patterns, negative_patterns)
-
-
-def filter_files(files: Iterable[str], file_patterns: Patterns) -> Iterable[str]:
-    """Returns all files that match any of the patterns."""
-    if VERBOSE:
-        log("Filtering with these file patterns: {}".format(file_patterns))
-    for file in files:
-        if not any(n.match(file) for n in file_patterns.negative):
-            if any(p.match(file) for p in file_patterns.positive):
-                yield file
-                continue
-        if VERBOSE:
-            log(f"{file} omitted due to file filters")
-
-
-async def get_all_files(paths: List[str]) -> List[str]:
-    """Returns all files that are tracked by git in the given paths."""
-    output = await run_shell_command(["git", "ls-files"] + paths)
-    return str(output).strip().splitlines()
-
-
 def find_changed_lines(diff: str) -> Dict[str, List[Tuple[int, int]]]:
     # Delay import since this isn't required unless using the --diff-file
     # argument, which for local runs people don't care about
@@ -446,11 +285,13 @@ def filter_from_diff_file(
     return filter_from_diff(paths, [diff])
 
 
-async def filter_default(paths: List[str]) -> Tuple[List[str], List[Dict[Any, Any]]]:
-    return await get_all_files(paths), []
+def filter_default(paths: List[str]) -> Tuple[List[str], List[Dict[Any, Any]]]:
+    return paths, []
 
 
-async def _run(options: Any) -> Tuple[CommandResult, List[ClangTidyWarning]]:
+async def run(
+    files: List[str], options: Any
+) -> Tuple[CommandResult, List[ClangTidyWarning]]:
     # These flags are pervasive enough to set it globally. It makes the code
     # cleaner compared to threading it through every single function.
     global VERBOSE
@@ -458,17 +299,11 @@ async def _run(options: Any) -> Tuple[CommandResult, List[ClangTidyWarning]]:
     VERBOSE = options.verbose
     QUIET = options.quiet
 
-    # Normalize the paths first
-    paths = [path.rstrip("/") for path in options.paths]
-
     # Filter files
     if options.diff_file:
-        files, line_filters = filter_from_diff_file(options.paths, options.diff_file)
+        files, line_filters = filter_from_diff_file(files, options.diff_file)
     else:
-        files, line_filters = await filter_default(options.paths)
-
-    file_patterns = get_file_patterns(options.glob, options.regex)
-    files = list(filter_files(files, file_patterns))
+        files, line_filters = filter_default(files)
 
     # clang-tidy errors when it does not get input files.
     if not files:
@@ -500,8 +335,3 @@ async def _run(options: Any) -> Tuple[CommandResult, List[ClangTidyWarning]]:
             log(str(w))
 
     return result, warnings
-
-
-def run(options: Any) -> Tuple[CommandResult, List[ClangTidyWarning]]:
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(_run(options))
